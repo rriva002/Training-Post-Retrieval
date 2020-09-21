@@ -64,7 +64,7 @@ def batch_experiments(source, experiment_type="keyword", method="cnn",
             random_samples = None
 
         if experiment_type == "keyword":
-            if generate_keywords or keywords is None or len(keywords) == 0:
+            if generate_keywords or keywords is None or len(keywords[i]) == 0:
                 directory = "keywords/{}".format(source)
                 t = topics[i].lower().replace(" ", "_")
                 filename = "{}/{}_{}_keywords.txt".format(directory, source, t)
@@ -439,9 +439,13 @@ def test_random_labeling(data, labels, data_lengths, classifier, test_data,
     print_results(data_lengths, results)
     return results
 
+
 batch_experiments("ds", "keyword")
 batch_experiments("ds", "ideal")
 batch_experiments("ds", "random")
+batch_experiments("huffpost", "keyword")
+batch_experiments("huffpost", "ideal")
+batch_experiments("huffpost", "random")
 batch_experiments("reddit", "keyword")
 batch_experiments("reddit", "ideal")
 batch_experiments("reddit", "random")
