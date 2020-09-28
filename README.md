@@ -37,3 +37,14 @@ Run main.py to perform the experiments on the data. Output to stdout and .csv fi
 * Accuracy of the CNN classifier trained with a dataset retrieved by the KSA.
 * Percent positive of the retrieved dataset.
 * Kullback-Liebler divergence of the positive and negative portions of the dataset as compared to a random dataset of equal size. Note these are labeled as "Diversity (Positives)" and "Diversity (Negatives)" in the output.
+
+The KSAs evaluated in the experiments are listed in the output as follows:
+* "50_50_naive": 50-50
+* "single_keyword": Single-Keyword
+* "top_k": TP-KSA
+* "top_k_prop": TPP-KSA
+* "top_k_randneg": TPRN-KSA
+* "top_k_prop_randneg": TPPRN-KSA
+* "liu": KSA that incorporates Double Ranking
+* "random": Randomly retrieved posts
+* "ideal": Selects 50% positive and 50% negative posts without considering keywords
