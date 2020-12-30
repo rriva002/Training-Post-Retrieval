@@ -63,9 +63,6 @@ class KeywordRanking(object):
 
     def __re_ranking(self, candidate_words, keywords, api):
         candidates_relevance_value = {}
-        remove_queried = api.get_remove_queried()
-
-        api.set_remove_queried(False)
 
         for one_candidate in candidate_words:
             matched_result = {}
@@ -102,8 +99,6 @@ class KeywordRanking(object):
                     relevance = float(matched_result[key]) / float(valid)
 
             candidates_relevance_value[cwl] = relevance
-
-        api.set_remove_queried(remove_queried)
 
         sorted_candidates = list(candidates_relevance_value.items())
         sorted_candidates.sort(key=itemgetter(1), reverse=True)

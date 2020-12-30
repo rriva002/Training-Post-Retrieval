@@ -1,41 +1,40 @@
 import csv
 import re
 from json import loads
-from nltk.stem import SnowballStemmer
-from nltk.tokenize import word_tokenize
-from sklearn.model_selection import train_test_split
+from os import makedirs, path
+from pathlib import Path
+from random import sample, seed
 
 
 data_dir = "data/"
 
 
-def construct_datasets(filename, topic, test_length, test_pos_ratio, pos, neg,
-                       use_stemmer, random_state):
-    stem = SnowballStemmer("english") if use_stemmer else None
-    related, non_related = [], []
+def assign_fold_ids(X, y, num_folds, random_state):
+    seed(random_state)
 
-    with open(filename, "r") as file:
+    indices = sample(range(len(X)), len(X))
+    fold_size = int(len(X) / num_folds)
+    fold_ids = []
+
+    for fold_id in range(num_folds):
+        fold_ids += [fold_id for _ in range(fold_size)]
+
+    fold_ids += [fold_id for fold_id in range(len(X) - len(fold_ids))]
+    return [X[i] for i in indices], [y[i] for i in indices], fold_ids
+
+
+def construct_cv_dataset(filename, num_folds, random_state):
+    X, y = [], []
+
+    with open(filename, "r", encoding="utf-8") as file:
         for row in csv.reader(file):
-            if row[1].lower() == topic.lower():
-                related.append(clean_str(row[0], stem))
-            else:
-                non_related.append(clean_str(row[0], stem))
+            X.append(clean_str(row[0]))
+            y.append(row[1].lower())
 
-    test_size_pos = round(test_length * test_pos_ratio)
-    test_size_neg = test_length - test_size_pos
-    pos_train, pos_test = train_test_split(related, test_size=test_size_pos,
-                                           random_state=random_state)
-    neg_train, neg_test = train_test_split(non_related,
-                                           test_size=test_size_neg,
-                                           random_state=random_state)
-    X_train = pos_train + neg_train
-    X_test = pos_test + neg_test
-    y_train = [pos] * len(pos_train) + [neg] * len(neg_train)
-    y_test = [pos] * len(pos_test) + [neg] * len(neg_test)
-    return X_train, y_train, X_test, y_test
+    return assign_fold_ids(X, y, num_folds, random_state)
 
 
-def clean_str(string, stemmer=None):
+def clean_str(string):
     string = re.sub(r"[^A-Za-z0-9(),!?\'\`]", " ", string)
     string = re.sub(r"\'s", " \'s", string)
     string = re.sub(r"\'ve", " \'ve", string)
@@ -49,44 +48,63 @@ def clean_str(string, stemmer=None):
     string = re.sub(r"\)", " ) ", string)
     string = re.sub(r"\?", " ? ", string)
     string = re.sub(r"\s{2,}", " ", string)
-    string = string.strip().lower()
-
-    if stemmer is not None:
-        string = " ".join([stemmer.stem(w) for w in word_tokenize(string)])
-
-    return string
+    return string.strip().lower()
 
 
-def load_data(source, topic, test_length, test_pos_ratio=0.5, pos="Positive",
-              neg="Negative", use_stemmer=False, random_state=None):
+def load_data(source, num_cv_folds=5, pos="Positive", neg="Negative",
+              random_state=None):
     if source == "ds":
-        return load_ds_data(topic, test_length, test_pos_ratio, pos, neg,
-                            use_stemmer, random_state=random_state)
+        return load_ds_data(num_cv_folds, pos, neg, random_state=random_state)
     elif source == "huffpost":
-        return load_huffpost_data(topic, test_length, test_pos_ratio, pos, neg,
-                                  use_stemmer, random_state=random_state)
+        return load_huffpost_data(num_cv_folds, pos, neg,
+                                  random_state=random_state)
     elif source == "reddit":
-        return load_reddit_data(topic, test_length, test_pos_ratio, pos, neg,
-                                use_stemmer, random_state=random_state)
+        return load_reddit_data(num_cv_folds, pos, neg,
+                                random_state=random_state)
 
 
-def load_ds_data(topic, test_length, test_pos_ratio=0.5, pos="Positive",
-                 neg="Negative", use_stemmer=False, random_state=None):
+def load_ds_data(num_cv_folds=5, pos="Positive", neg="Negative",
+                 random_state=None):
     filename = data_dir + "ds_data.csv"
-    return construct_datasets(filename, topic, test_length, test_pos_ratio,
-                              pos, neg, use_stemmer, random_state)
+
+    if not path.exists(data_dir):
+        makedirs(data_dir)
+
+    if not Path(filename).is_file():
+        source = "http://www.dailystrength.org"
+        sql = "SELECT url, body, disorder FROM {} WHERE source = '{}' "
+        sql += "AND url LIKE '{}/group/%' AND replyid = 0 AND body IS NOT NULL"
+        urls = set()
+        connection = mysql_connection()
+        cursor = connection.cursor()
+
+        with open(filename, "w") as file:
+            writer = csv.writer(file, lineterminator="\n")
+
+            cursor.execute(sql.format("healthforumposts", source, source))
+
+            for (url, body, disorder) in cursor:
+                text = str(body)
+
+                if url in urls or len(text.strip()) == 0:
+                    continue
+
+                urls.add(url)
+                writer.writerow([text.replace("\n", " "), disorder])
+
+        del urls
+
+    return construct_cv_dataset(filename, num_cv_folds, random_state)
 
 
-def load_huffpost_data(category, test_length, test_pos_ratio=0.5,
-                       pos="Positive", neg="Negative", use_stemmer=False,
+def load_huffpost_data(num_cv_folds=5, pos="Positive", neg="Negative",
                        random_state=None):
-    stem = SnowballStemmer("english") if use_stemmer else None
-    related, non_related = [], []
     mappings = {"ARTS": "ARTS & CULTURE", "CULTURE & ARTS": "ARTS & CULTURE",
                 "PARENTS": "PARENTING", "STYLE": "STYLE & BEAUTY",
                 "THE WORLDPOST": "WORLDPOST", "WELLNESS": "HEALTHY LIVING"}
+    X, y = [], []
 
-    with open("data/News_Category_Dataset_v2.json", "r") as file:
+    with open(data_dir + "News_Category_Dataset_v2.json", "r") as file:
         for line in file:
             json = loads(line)
             text = " ".join([json["headline"], json["short_description"]])
@@ -95,28 +113,50 @@ def load_huffpost_data(category, test_length, test_pos_ratio=0.5,
             if extracted_category in mappings:
                 extracted_category = mappings[extracted_category]
 
-            if extracted_category == category:
-                related.append(clean_str(text, stem))
-            else:
-                non_related.append(clean_str(text, stem))
+            X.append(clean_str(text))
+            y.append(extracted_category.lower())
 
-    test_size_pos = round(test_length * test_pos_ratio)
-    test_size_neg = test_length - test_size_pos
-    pos_train, pos_test = train_test_split(related, test_size=test_size_pos,
-                                           random_state=random_state)
-    neg_train, neg_test = train_test_split(non_related,
-                                           test_size=test_size_neg,
-                                           random_state=random_state)
-    X_train = pos_train + neg_train
-    X_test = pos_test + neg_test
-    y_train = [pos] * len(pos_train) + [neg] * len(neg_train)
-    y_test = [pos] * len(pos_test) + [neg] * len(neg_test)
-    return X_train, y_train, X_test, y_test
+    return assign_fold_ids(X, y, num_cv_folds, random_state)
 
 
-def load_reddit_data(subreddit, test_length, test_pos_ratio=0.5,
-                     pos="Positive", neg="Negative", use_stemmer=False,
+def load_reddit_data(num_cv_folds=5, pos="Positive", neg="Negative",
                      random_state=None):
     filename = data_dir + "reddit_data.csv"
-    return construct_datasets(filename, subreddit, test_length, test_pos_ratio,
-                              pos, neg, use_stemmer, random_state)
+
+    if not path.exists(data_dir):
+        makedirs(data_dir)
+
+    if not Path(filename).is_file():
+        ecig, source = "Electronic Cigarette", "https://www.reddit.com"
+        sql = "SELECT url, body, disorder FROM {} WHERE source = '{}' "
+        sql += "AND replyid = 0 AND body != '[removed]' AND body IS NOT NULL"
+        urls = set()
+        connection = mysql_connection()
+        cursor = connection.cursor()
+
+        with open(filename, "w") as file:
+            writer = csv.writer(file, lineterminator="\n")
+
+            for table in ["healthforumposts", "ecigarette"]:
+                cursor.execute(sql.format(table, source))
+
+                for (url, body, disorder) in cursor:
+                    text = str(body)
+
+                    if url in urls or len(text.strip()) == 0:
+                        continue
+
+                    sub = ecig if table == "ecigarette" else disorder
+
+                    urls.add(url)
+                    writer.writerow([text.replace("\n", " "), sub])
+
+        del urls
+
+    return construct_cv_dataset(filename, num_cv_folds, random_state)
+
+
+def mysql_connection():
+    from mysql import connector
+    return connector.connect(host="dblab-rack20", database="HEALTHDATA",
+                             user="rriva002", password="passwd", use_pure=True)

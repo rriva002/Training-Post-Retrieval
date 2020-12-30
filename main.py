@@ -1,9 +1,11 @@
 import csv
+from cnn_text_classification import CNNClassifier
 from data_loading import load_data
 from json import loads
-from numpy import transpose
+from math import exp
 from os import makedirs, path
 from pathlib import Path
+from queue import Queue
 from random import sample, seed
 from scipy.stats import entropy
 from simulated_api import SimulatedAPI
@@ -12,181 +14,190 @@ from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.feature_selection import mutual_info_classif
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
 from sklearn.metrics import make_scorer, precision_score, recall_score
-from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
-from sklearn.svm import LinearSVC
+from sklearn.svm import SVC
 from text_dataset_labeling_assistant import TextDatasetLabelingAssistant as LA
-from cnn_text_classification import CNNClassifier
+from threading import Lock, Thread
 from time import time
 
-default_data_lengths = [100 * i for i in range(1, 11)]
-default_modes = ["50_50_naive", "single_keyword", "top_k", "top_k_prop",
-                 "top_k_randneg", "top_k_prop_randneg", "liu"]
-default_stats = ["Accuracy", "Percent Positive", "Diversity"]
+default_data_lengths = [100 * (i + 1) for i in range(10)]
+default_ksas = ["all_keywords", "50_50", "tp_ksa", "tpp_ksa", "tprn_ksa",
+                "tpprn_ksa", "liu", "random", "ideal"]
+default_stats = ["accuracy", "precision", "recall", "percent_positive",
+                 "kl_pos", "kl_neg", "balance_and_diversity", "time"]
 
 
-def batch_experiments(source, experiment_type="keyword", method="cnn",
-                      random_state=10, generate_keywords=True, n_keywords=5,
-                      modes=default_modes, stats=default_stats,
-                      data_lengths=default_data_lengths):
-    pos, neg, rs = "Positive", "Negative", random_state
-    topics, keywords, results = [], [], {}
+class CVThread(Thread):
+    def __init__(self, assist, classifier, data_lengths, generate_keywords,
+                 keywords, ksas, lock, n_keywords, neg, pos, queue,
+                 random_state, results, stats, topic, *args, **kwargs):
+        self.assist = assist
+        self.classifier = classifier
+        self.data_lengths = data_lengths
+        self.queue = queue
+        self.generate_kw = generate_keywords
+        self.kw = keywords
+        self.ksas = ksas
+        self.lock = lock
+        self.n_keywords = n_keywords
+        self.neg = neg
+        self.pos = pos
+        self.random_state = random_state
+        self.results = results
+        self.stats = stats
+        self.topic = topic
+
+        super().__init__(*args, **kwargs)
+
+    def run(self):
+        while not self.queue.empty():
+            fold, num_cv_folds = self.queue.get()
+
+            seed(self.random_state)
+            self.assist.get_api().set_test_fold_id(fold)
+
+            if "kl_pos" in self.stats or "kl_neg" in self.stats:
+                random_samples = generate_random_samples(self.assist.get_api(),
+                                                         self.pos, self.neg,
+                                                         self.data_lengths[-1])
+            else:
+                random_samples = None
+
+            if self.generate_kw or self.kw is None or len(self.kw) == 0:
+                directory = "keywords/{}".format(source)
+                t = self.topic.lower().replace(" ", "_")
+                fn = "{}/{}_keywords_{}_{}.txt".format(directory, t, fold,
+                                                       num_cv_folds)
+
+                if not path.exists(directory):
+                    makedirs(directory)
+
+                if Path(fn).is_file():
+                    with open(fn, "r") as file:
+                        keywords = [line.rstrip("\n") for line in file]
+                        keywords = keywords[:min(len(keywords),
+                                                 self.n_keywords)]
+                else:
+                    keywords = ig_keywords(self.assist.get_api(),
+                                           self.n_keywords, self.pos, fn,
+                                           random_state=self.random_state)
+            else:
+                keywords = self.kw
+
+            for ksa in self.ksas:
+                for m in self.data_lengths:
+                    print("    Fold {}: {}, m={}".format(fold, ksa, m))
+                    test(self.topic, keywords, self.assist, self.classifier,
+                         m, self.pos, self.neg, self.results, random_samples,
+                         ksa=ksa, random_state=self.random_state,
+                         lock=self.lock)
+
+            self.queue.task_done()
+
+
+def batch_experiments(source, classifier="cnn", generate_keywords=True,
+                      n_keywords=5, num_cv_folds=5, num_threads="cv",
+                      random_state=None, ksas=default_ksas,
+                      stats=default_stats, data_lengths=default_data_lengths):
+    pos, neg = "Positive", "Negative"
+    topics, keywords = [], []
+
+    print("Source: " + source)
 
     with open("{}.json".format(source), "r") as file:
         for topic, manual_keywords in loads(file.read()).items():
             topics.append(topic)
             keywords.append(manual_keywords)
 
-    keywords_old = keywords
+    X, y, cv_fold_ids = load_data(source, num_cv_folds=num_cv_folds, pos=pos,
+                                  neg=neg, random_state=random_state)
+    assist = LA(SimulatedAPI(X, labels=y, cv_fold_ids=cv_fold_ids))
+    percentage_stats = {"accuracy", "balanced_accuracy", "percent_positive"}
+    results = dict(zip(topics, [{} for topic in topics]))
+    queue, lock = Queue(), Lock()
 
-    for i in range(len(topics)):
-        seed(random_state)
-        print(topics[i])
+    for topic in topics:
+        for ksa in ksas:
+            results[topic][ksa] = dict(zip(stats, [{} for stat in stats]))
 
-        results[topics[i]] = {}
-        classifier = configure_classifier(method, random_state=random_state)
-        X_train, y_train, X_test, y_test = load_data(source, topics[i], 1000,
-                                                     pos=pos, neg=neg,
-                                                     random_state=rs)
+            for stat in stats:
+                for m in data_lengths:
+                    results[topic][ksa][stat][m] = []
 
-        if experiment_type == "keyword":
-            assist = LA(SimulatedAPI(X_train, y_train))
+    for i, topic in enumerate(topics):
+        print("  Topic: " + topic)
+        assist.get_api().assign_binary_labels(topic, pos=pos, neg=neg)
 
-        if "Diversity" in stats:
-            Xp = [X_train[i] for i in range(len(X_train)) if y_train[i] == pos]
-            Xn = [X_train[i] for i in range(len(X_train)) if y_train[i] == neg]
-            random_pos = sample(range(len(Xp)), min(len(Xp), data_lengths[-1]))
-            random_neg = sample(range(len(Xn)), min(len(Xn), data_lengths[-1]))
-            random_samples = {pos: [Xp[i] for i in random_pos],
-                              neg: [Xn[i] for i in random_neg]}
-            Xp, Xn, random_pos, random_neg = None, None, None, None
-        else:
-            random_samples = None
+        for fold in range(num_cv_folds):
+            queue.put((fold, num_cv_folds))
 
-        if experiment_type == "keyword":
-            if generate_keywords or keywords is None or len(keywords[i]) == 0:
-                directory = "keywords/{}".format(source)
-                t = topics[i].lower().replace(" ", "_")
-                filename = "{}/{}_{}_keywords.txt".format(directory, source, t)
+        for _ in range(num_cv_folds if num_threads == "cv" else num_threads):
+            CVThread(assist, classifier, data_lengths, generate_keywords,
+                     keywords[i], ksas, lock, n_keywords, neg, pos, queue,
+                     random_state, results, stats, topic).start()
 
-                if not path.exists(directory):
-                    makedirs(directory)
+        queue.join()
 
-                keywords = select_keywords(X_train, y_train, n_keywords, pos,
-                                           filename, random_state=rs)
-            else:
-                keywords = keywords[i]
-        elif experiment_type == "random":
-            print(experiment_type + ":")
+        for ksa in ksas:
+            for stat in stats:
+                for m in data_lengths:
+                    result = sum(results[topic][ksa][stat][m]) / num_cv_folds
 
-            r = test_random_labeling(X_train, y_train, data_lengths,
-                                     classifier, X_test, y_test, pos, stats,
-                                     random_samples)
+                    if stat in percentage_stats:
+                        result = "%0.2f" % (100 * result) + "%"
+                    else:
+                        result = "%0.4f" % result
 
-            results[topics[i]][experiment_type] = r
-            continue
-        elif experiment_type == "ideal":
-            print(experiment_type + ":")
+                    results[topic][ksa][stat][m] = result
 
-            r = test_ideal_labeling(X_train, y_train, data_lengths, classifier,
-                                    X_test, y_test, pos, stats, random_samples,
-                                    random_state=rs, remove_first_kw=False)
-            results[topics[i]][experiment_type] = r
-            continue
-
-        print(" ".join(["Keywords:"] + keywords))
-
-        for mode in modes:
-            r = test_keyword_labeling(keywords, data_lengths, assist,
-                                      classifier, X_test, y_test, pos, stats,
-                                      random_samples, mode=mode)
-            results[topics[i]][mode] = r
-
-        del X_train
-        del y_train
-        del assist
-
-        keywords = keywords_old
-
-    filename = "{}_results_{}.csv".format(source, experiment_type)
-
-    with open(filename, "w") as file:
+    with open("{}_results.csv".format(source), "w") as file:
         writer = csv.writer(file, lineterminator="\n")
-        modes = [experiment_type] if experiment_type != "keyword" else modes
-        stats = sorted(list(results[topics[0]][modes[0]].keys()))
 
         for topic in topics:
             header = [topic]
 
             for stat in stats:
-                header += [stat] + ["" for ln in data_lengths]
+                header += [stat] + ["" for _ in data_lengths]
 
             writer.writerow(header)
-            writer.writerow([""] + ["m={}".format(ln) for ln in data_lengths])
+            writer.writerow([""] + ["m={}".format(m) for m in data_lengths])
 
-            for mode in modes:
-                if mode not in results[topic]:
-                    continue
-
-                row = [mode]
+            for ksa in ksas:
+                row = [ksa]
 
                 for stat in stats:
-                    r = results[topic][mode][stat]
-                    row += [r[ln] for ln in data_lengths] + [""]
+                    r = results[topic][ksa][stat]
+                    row += [r[m] for m in data_lengths] + [""]
 
                 writer.writerow(row[:-1])
 
             writer.writerow([""])
 
 
-def build_results_dict(stats):
-    results = {}
-
-    for stat in stats:
-        if stat == "Percent with Keyword" or stat == "Diversity":
-            results[stat + " (Positives)"] = {}
-            results[stat + " (Negatives)"] = {}
-        else:
-            results[stat] = {}
-
-    return results
+def generate_random_samples(api, pos, neg, m):
+    X, y = api.train_data()
+    Xp = [X[i] for i in range(len(X)) if y[i] == pos]
+    Xn = [X[i] for i in range(len(X)) if y[i] == neg]
+    return {pos: sample(Xp, min(len(Xp), m)), neg: sample(Xn, min(len(Xn), m))}
 
 
-def configure_classifier(classifier, grid_search=False, random_state=None):
-    scoring = make_scorer(balanced_accuracy_score)
-    n_jobs = 1 if classifier == "cnn" or classifier == "rf" else -1
+def ig_keywords(api, n, positive, filename, min_df=2, max_df=1.0,
+                random_state=None):
+    X, y = api.train_data()
+    vec = CountVectorizer(min_df=min_df, max_df=max_df, stop_words="english")
 
-    if classifier == "cnn":
-        classifier = CNNClassifier(random_state=random_state, scoring=scoring,
-                                   vectors="fasttext.en.300d")
-        param_grid = {"kernel_sizes": [(2, 3, 4), (3, 4, 5), (4, 5, 6)],
-                      "kernel_num": [100, 200, 300, 400, 500, 600]}
-    else:
-        vectorizer = TfidfVectorizer(max_features=1000, min_df=0.03,
-                                     ngram_range=(1, 3), stop_words="english")
-        param_grid = {"vectorizer__max_features": [500, 1000, None],
-                      "vectorizer__min_df": [1, 0.01, 0.03]}
+    vec.fit([X[i] for i in range(len(X)) if y[i] == positive])
 
-        if classifier == "rf":
-            classifier = RandomForestClassifier(n_estimators=2000, n_jobs=-1,
-                                                random_state=random_state,
-                                                class_weight="balanced")
-            param_grid["classifier__n_estimators"] = [10, 100, 1000]
-            param_grid["classifier__max_depth"] = [2, 10, None]
-        elif classifier == "svm":
-            classifier = LinearSVC(random_state=random_state, max_iter=10000,
-                                   class_weight="balanced")
-            param_grid["classifier__C"] = [0.001, 0.01, 0.1, 1.0, 10.0]
-            param_grid["classifier__loss"] = ["hinge", "squared_hinge"]
+    ig = mutual_info_classif(vec.transform(X), y, random_state=random_state)
+    non_keywords = {"quot", "039", "http", "https", "com", "www"}
+    keywords = [(word, ig[i]) for word, i in vec.vocabulary_.items()]
+    keywords = sorted(keywords, key=lambda keyword: keyword[1], reverse=True)
+    keywords = [kw[0] for kw in keywords if kw[0] not in non_keywords]
 
-        classifier = Pipeline([("vectorizer", vectorizer),
-                               ("classifier", classifier)])
+    with open(filename, "w") as file:
+        file.writelines([keyword + "\n" for keyword in keywords])
 
-    if grid_search:
-        return GridSearchCV(classifier, scoring=scoring, cv=5, iid=False,
-                            param_grid=param_grid, n_jobs=n_jobs)
-
-    return classifier
+    return keywords[:min(n, len(keywords))]
 
 
 def kl(X, y, label, random_sample, min_df=1, max_df=1.0):
@@ -199,253 +210,123 @@ def kl(X, y, label, random_sample, min_df=1, max_df=1.0):
     except ValueError:
         return float("inf")
 
-    return entropy(transpose(p), transpose(q))
+    return entropy(p, q, axis=1)[0]
 
 
-def prepare_results(results, stats, test_results, elapsed, data_len):
-    stats = set(stats)
-    accuracy = "Accuracy"
-    bal_acc = "Balanced Accuracy"
-    pct_pos = "Percent Positive"
-    pct_kw = "Percent with Keyword"
-    precision = "Precision"
-    recall = "Recall"
-    diversity = "Diversity"
-    time = "Time"
-    fmt_2, fmt_4 = "%0.2f", "%0.4f"
+def select_classifier(classifier, random_state=None, active_learning=False):
+    if classifier == "cnn":
+        scoring = make_scorer(balanced_accuracy_score)
+        return CNNClassifier(scoring=scoring, vectors="fasttext.en.300d",
+                             random_state=random_state, static=True, epochs=50,
+                             batch_size=100)
 
-    if accuracy in stats:
-        results[accuracy][data_len] = fmt_2 % test_results["accuracy"] + "%"
+    vectorizer = TfidfVectorizer(max_features=1000, min_df=0.03,
+                                 ngram_range=(1, 3), stop_words="english")
 
-    if bal_acc in stats:
-        results[bal_acc][data_len] = fmt_2 % test_results["balanced"] + "%"
+    if classifier == "rf":
+        classifier = RandomForestClassifier(n_estimators=2000, n_jobs=-1,
+                                            random_state=random_state,
+                                            class_weight="balanced")
+    elif classifier == "svm":
+        classifier = SVC(kernel="linear", probability=active_learning,
+                         class_weight="balanced", random_state=random_state)
 
-    if pct_pos in stats:
-        results[pct_pos][data_len] = fmt_2 % test_results["positive"] + "%"
-
-    if pct_kw in stats:
-        kw_pos, kw_neg = pct_kw + " (Positives)", pct_kw + " (Negatives)"
-        results[kw_pos][data_len] = fmt_2 % test_results["kw_pos"] + "%"
-        results[kw_neg][data_len] = fmt_2 % test_results["kw_neg"] + "%"
-
-    if precision in stats:
-        results[precision][data_len] = fmt_4 % test_results["precision"]
-
-    if recall in stats:
-        results[recall][data_len] = fmt_4 % test_results["recall"]
-
-    if diversity in stats:
-        div_p, div_n = diversity + " (Positives)", diversity + " (Negatives)"
-        results[div_p][data_len] = fmt_4 % test_results["diversity_positive"]
-        results[div_n][data_len] = fmt_4 % test_results["diversity_negative"]
-
-    if time in stats:
-        results[time][data_len] = str(round(elapsed))
-
-    return results
+    return Pipeline([("vectorizer", vectorizer), ("classifier", classifier)])
 
 
-def print_results(data_lengths, results):
-    for stat in sorted(list(results.keys())):
-        print(stat + ":\n" + "\t".join([str(ln) for ln in data_lengths]))
-        print("\t".join([results[stat][ln] for ln in data_lengths]))
-        print("")
+def test(topic, keywords, assist, classifier, m, positive, negative, results,
+         random_samples, ksa="50_50", random_state=None, lock=None):
+    assist.get_api().set_random_state(random_state)
 
+    stats = results[topic][ksa].keys()
+    lock_early = classifier == "cnn"
+    start = time()
 
-def select_keywords(X, y, n, positive, filename, min_df=2, max_df=1.0,
-                    random_state=None):
-    if Path(filename).is_file():
-        with open(filename, "r") as file:
-            keywords = [line.rstrip("\n") for line in file]
-            return keywords[:min(len(keywords), n)]
+    if ksa == "50_50":
+        X, y = assist.fifty_fifty(keywords, m)
+    elif ksa == "tp_ksa":
+        X, y = assist.tp_ksa(keywords, m)
+    elif ksa == "tpp_ksa":
+        X, y = assist.tp_ksa(keywords, m, proportional=True)
+    elif ksa == "tprn_ksa":
+        X, y = assist.tp_ksa(keywords, m, rand_neg=True)
+    elif ksa == "tpprn_ksa":
+        X, y = assist.tp_ksa(keywords, m, proportional=True, rand_neg=True)
+    elif ksa == "all_keywords":
+        X, y = assist.all_keywords(keywords, m)
+    elif ksa == "active_learning":
+        if lock is not None and lock_early:
+            lock.acquire()
 
-    vec = CountVectorizer(min_df=min_df, max_df=max_df, stop_words="english")
+        classifier = select_classifier(classifier, random_state=random_state,
+                                       active_learning=True)
+        X, y = assist.active_learning(classifier, m, keywords=keywords,
+                                      batch_size=int(m / 10))
+    elif ksa == "liu":
+        X, y = assist.liu(keywords, m)
+    elif ksa == "random":
+        X, y = assist.random(m)
+    elif ksa == "ideal":
+        X, y = assist.ideal(m)
 
-    vec.fit([X[i] for i in range(len(X)) if y[i] == positive])
+    elapsed = round(time() - start)
+    X_test, y_test = assist.get_api().test_data()
 
-    ig = mutual_info_classif(vec.transform(X), y, random_state=random_state)
-    non_keywords = set(["quot", "039", "http", "https", "com", "www"])
-    keywords = [(word, ig[i]) for word, i in vec.vocabulary_.items()]
-    keywords = sorted(keywords, key=lambda keyword: keyword[1], reverse=True)
-    keywords = [kw[0] for kw in keywords if kw[0] not in non_keywords]
-
-    with open(filename, "w") as file:
-        file.writelines([keyword + "\n" for keyword in keywords])
-
-    return keywords[:min(n, len(keywords))]
-
-
-def test(classifier, X, y, test_data, test_labels, positive, random_state,
-         keyword=None):
-    if isinstance(classifier, GridSearchCV):
-        classifier.estimator.set_params(classifier__random_state=random_state)
-    elif isinstance(classifier, Pipeline):
-        classifier.set_params(classifier__random_state=random_state)
-    else:
-        classifier.set_params(random_state=random_state)
+    if lock is not None and ksa != "active_learning" and lock_early:
+        lock.acquire()
 
     if len(set(y)) == 1:
-        predictions = [y[0] for x in test_data]
+        predictions = [y[0] for x in X_test]
     else:
-        classifier.fit(X, y)
-        predictions = classifier.predict(test_data)
+        if ksa != "active_learning":
+            classifier = select_classifier(classifier,
+                                           random_state=random_state)
+            classifier.fit(X, y)
 
-    acc = 100 * accuracy_score(test_labels, predictions)
-    bal_acc = 100 * balanced_accuracy_score(test_labels, predictions)
-    precision = precision_score(test_labels, predictions, pos_label=positive)
-    recall = recall_score(test_labels, predictions, pos_label=positive)
-    positives = [X[i] for i in range(len(X)) if y[i] == positive]
-    pct_pos = 100 * len(positives) / len(X)
-    results = {"accuracy": acc, "balanced": bal_acc, "positive": pct_pos,
-               "precision": precision, "recall": recall}
+        predictions = classifier.predict(X_test)
 
-    if keyword is not None:
-        negatives = [X[i] for i in range(len(X)) if y[i] != positive]
-        kw_pos = sum([1 for x in positives if keyword in x]) / len(positives)
-        kw_neg = sum([1 for x in negatives if keyword in x]) / len(negatives)
-        results["kw_pos"] = 100 * kw_pos
-        results["kw_neg"] = 100 * kw_neg
+    if lock is not None and not lock_early:
+        lock.acquire()
 
-    return results
+    for stat in stats:
+        if stat == "accuracy":
+            value = accuracy_score(y_test, predictions)
+        elif stat == "balanced_accuracy":
+            value = balanced_accuracy_score(y_test, predictions)
+        elif stat == "precision":
+            value = precision_score(y_test, predictions, pos_label=positive,
+                                    zero_division=0)
+        elif stat == "recall":
+            value = recall_score(y_test, predictions, pos_label=positive)
+        elif stat == "percent_positive":
+            n_pos = len([X[i] for i in range(len(X)) if y[i] == positive])
+            value = n_pos / len(X)
+        elif stat == "kl_pos":
+            value = kl(X, y, positive, random_samples[positive])
+        elif stat == "kl_neg":
+            value = kl(X, y, negative, random_samples[negative])
+        elif stat == "time":
+            value = elapsed
 
+        results[topic][ksa][stat][m].append(value)
 
-def test_ideal_labeling(X_train, y_train, data_lengths, classifier, X_test,
-                        y_test, positive, stats, random_samples, filename=None,
-                        random_state=10, remove_first_kw=False):
-    results = build_results_dict(stats)
-    X_pos = [X_train[i] for i in range(len(X_train)) if y_train[i] == positive]
-    X_neg = [X_train[i] for i in range(len(X_train)) if y_train[i] != positive]
-    y_neg = [y_train[i] for i in range(len(y_train)) if y_train[i] != positive]
+    if "balance_and_diversity" in stats and "percent_positive" in stats and \
+            "kl_pos" in stats and "kl_neg" in stats:
+        percent_positive = results[topic][ksa]["percent_positive"][m][-1]
+        balance = 1 - 2 * abs(0.5 - percent_positive)
+        diversity_pos = exp(-results[topic][ksa]["kl_pos"][m][-1])
+        diversity_neg = exp(-results[topic][ksa]["kl_neg"][m][-1])
 
-    if filename is not None and Path(filename).is_file():
-        with open(filename, "r") as file:
-            keyword = [line.rstrip("\n") for line in file][0]
-    else:
-        keyword = None
+        if percent_positive > 0 and diversity_pos > 0 and diversity_neg > 0:
+            bd = 3 / (1 / balance + 1 / diversity_pos + 1 / diversity_neg)
+            results[topic][ksa]["balance_and_diversity"][m].append(bd)
+        else:
+            results[topic][ksa]["balance_and_diversity"][m].append(0)
 
-    for data_length in data_lengths:
-        seed(random_state)
-
-        start = time()
-        half = int(round(data_length / 2))
-        pos_indices = sample(range(len(X_pos)), half)
-        neg_indices = sample(range(len(X_neg)), data_length - half)
-        X = [X_pos[index] for index in pos_indices]
-
-        if remove_first_kw and keyword is not None:
-            X = [x for x in X if keyword not in x]
-
-        y = [positive for i in range(len(X))]
-        X += [X_neg[index] for index in neg_indices]
-        y += [y_neg[index] for index in neg_indices]
-        elapsed = round(time() - start)
-        rs = test(classifier, X, y, X_test, y_test, positive,
-                  random_state, keyword=keyword)
-
-        if "Diversity" in stats:
-            for label, random_sample in random_samples.items():
-                key = "diversity_{}".format(label.lower())
-                rs[key] = kl(X, y, label, random_samples[label])
-
-        results = prepare_results(results, stats, rs, elapsed, data_length)
-
-    print_results(data_lengths, results)
-    return results
+    if lock is not None:
+        lock.release()
 
 
-def test_keyword_labeling(keywords, data_lengths, assist, classifier,
-                          test_data, test_labels, positive, stats,
-                          random_samples, mode="50_50", use_all_kw=False,
-                          random_state=10, filename=None):
-    results = build_results_dict(stats)
-
-    for data_length in data_lengths:
-        assist.get_api().set_random_state(random_state)
-
-        start = time()
-
-        if mode == "50_50_naive":
-            X, y = assist.label_with_naive_50_50(keywords[0], data_length)
-        elif mode == "top_k":
-            X, y = assist.label_with_top_k(keywords, data_length,
-                                           rand_neg=False)
-        elif mode == "top_k_prop":
-            X, y = assist.label_with_top_k(keywords, data_length,
-                                           proportional=True, rand_neg=False)
-        elif mode == "top_k_randneg":
-            X, y = assist.label_with_top_k(keywords, data_length,
-                                           rand_neg=True)
-        elif mode == "top_k_prop_randneg":
-            X, y = assist.label_with_top_k(keywords, data_length,
-                                           proportional=True, rand_neg=True)
-        elif mode == "single_keyword":
-            X, y = assist.get_api().query([keywords[0]], data_length)
-
-            if len(X) < data_length:
-                X_r, y_r = assist.get_api().query(None, data_length - len(X))
-                X += X_r
-                y += y_r
-        elif mode == "liu":
-            X, y = assist.label_with_liu(keywords, data_length)
-
-        assist.get_api().reset()
-
-        elapsed = round(time() - start)
-        rs = test(classifier, X, y, test_data, test_labels, positive,
-                  random_state)
-
-        if "Diversity" in stats:
-            for label, random_sample in random_samples.items():
-                key = "diversity_{}".format(label.lower())
-                rs[key] = kl(X, y, label, random_samples[label])
-
-        results = prepare_results(results, stats, rs, elapsed, data_length)
-
-        if filename is not None:
-            with open(filename, "w") as file:
-                writer = csv.writer(file, lineterminator="\n")
-
-                for i in range(len(X)):
-                    writer.writerow([X[i], y[i]])
-
-    print(mode + ":")
-    print_results(data_lengths, results)
-    return results
-
-
-def test_random_labeling(data, labels, data_lengths, classifier, test_data,
-                         test_labels, positive, stats, random_samples,
-                         random_state=10):
-    results = build_results_dict(stats)
-
-    for data_length in data_lengths:
-        seed(random_state)
-
-        start = time()
-        indices = sample(range(len(data)), data_length)
-        X = [data[index] for index in indices]
-        y = [labels[index] for index in indices]
-        elapsed = round(time() - start)
-        rs = test(classifier, X, y, test_data, test_labels, positive,
-                  random_state)
-
-        if "Diversity" in stats:
-            for label, random_sample in random_samples.items():
-                key = "diversity_{}".format(label.lower())
-                rs[key] = kl(X, y, label, random_samples[label])
-
-        results = prepare_results(results, stats, rs, elapsed, data_length)
-
-    print_results(data_lengths, results)
-    return results
-
-
-batch_experiments("ds", "keyword")
-batch_experiments("ds", "ideal")
-batch_experiments("ds", "random")
-batch_experiments("huffpost", "keyword")
-batch_experiments("huffpost", "ideal")
-batch_experiments("huffpost", "random")
-batch_experiments("reddit", "keyword")
-batch_experiments("reddit", "ideal")
-batch_experiments("reddit", "random")
+if __name__ == "__main__":
+    for source in ["ds", "huffpost", "reddit"]:
+        batch_experiments(source, random_state=10)

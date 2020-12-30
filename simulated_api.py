@@ -1,33 +1,43 @@
 from nltk.tokenize import word_tokenize
 from random import seed, sample
+from threading import get_ident, Lock
 
 
 class SimulatedAPI(object):
-    def __init__(self, data, labels=None, random_data=None, random_labels=None,
-                 remove_queried=False):
+    def __init__(self, data, labels=None, cv_fold_ids=None):
+        self.__cv_fold_ids = cv_fold_ids
         self.__data = data
-        self.__indices_added = set()
-        self.__labels = labels
+        self.__labels = None
+        self.__lock = Lock()
         self.__query_cache = {}
-        self.__remove_queried = remove_queried
+        self.__query_indices = {}
         self.__tokenized = [set(word_tokenize(document)) for document in data]
+        self.__topics = labels
 
-        if random_data is not None:
-            self.__random_api = SimulatedAPI(random_data, random_labels,
-                                             remove_queried=remove_queried)
-        else:
-            self.__random_api = None
+    def assign_binary_labels(self, topic, pos="Positive", neg="Negative"):
+        if self.__topics is not None:
+            t1 = topic.lower()
+            self.__labels = [pos if t1 == t2 else neg for t2 in self.__topics]
 
-    def get_remove_queried(self):
-        return self.__remove_queried
+    def get_active_learning_pool_indices(self, pool_size):
+        query_indices = self.__query_indices[get_ident()]
+        indices = [i for i in range(len(self.__data)) if i in query_indices]
+        return indices if pool_size == "all" else sample(indices, pool_size)
+
+    def get_data(self, indices):
+        X = [self.__data[index] for index in indices]
+
+        if self.__labels is None:
+            return X, [None] * len(X)
+
+        y = [self.__labels[index] for index in indices]
+        return X, y
 
     def query(self, keywords, n=1, negated_keywords=[]):
-        if keywords is None or len(keywords) == 0:
-            if self.__random_api is not None:
-                return self.__random_api.query(None, n)
+        query_indices = self.__query_indices[get_ident()]
 
-            sample_range = set(range(len(self.__data)))
-            indices = sample(sample_range.difference(self.__indices_added), n)
+        if keywords is None or len(keywords) == 0:
+            indices = sample(query_indices, n)
             X = [self.__data[i] for i in indices]
 
             if self.__labels is not None:
@@ -35,29 +45,22 @@ class SimulatedAPI(object):
             else:
                 y = [None] * len(X)
 
-            if self.__remove_queried:
-                self.__indices_added.update(indices)
-
             return X, y
 
-        key = " ".join(keywords + ["-" + k for k in negated_keywords])
+        sample_range = set()
+        keywords = [keywords] if isinstance(keywords, str) else keywords
+        negated_keywords = [negated_keywords] if \
+            isinstance(negated_keywords, str) else negated_keywords
 
-        if key not in self.__query_cache:
-            self.__query_cache[key] = set()
-            keywords = set(keywords)
-            negated_keywords = set(negated_keywords)
+        for keyword in keywords:
+            self.update_cache(keyword)
+            sample_range.update(self.__query_cache[keyword])
 
-            for i in range(len(self.__tokenized)):
-                t = self.__tokenized[i]
+        for keyword in negated_keywords:
+            self.update_cache(keyword)
+            sample_range.difference_update(self.__query_cache[keyword])
 
-                if len(keywords.intersection(t)) > 0 and \
-                        len(negated_keywords.intersection(t)) == 0:
-                    self.__query_cache[key].add(i)
-
-        sample_range = set(self.__query_cache[key])
-
-        if self.__remove_queried:
-            sample_range = sample_range.difference(self.__indices_added)
+        sample_range.intersection_update(query_indices)
 
         if len(sample_range) > 0:
             indices = sample(sample_range, min(n, len(sample_range)))
@@ -68,24 +71,49 @@ class SimulatedAPI(object):
             else:
                 y = [None] * len(X)
 
-            if self.__remove_queried:
-                self.__indices_added.update(indices)
-
             return X, y
 
         return [], []
 
-    def reset(self):
-        self.__indices_added.clear()
-
-        if self.__random_api is not None:
-            self.__random_api.reset()
-
     def set_random_state(self, random_state):
         seed(random_state)
 
-        if self.__random_api is not None:
-            self.__random_api.set_random_state(random_state)
+    def set_test_fold_id(self, test_fold_id):
+        thread_id = get_ident()
 
-    def set_remove_queried(self, remove_queried):
-        self.__remove_queried = remove_queried
+        self.__lock.acquire()
+
+        if self.__cv_fold_ids is not None:
+            self.__query_indices[thread_id] = set()
+
+            for i in range(len(self.__data)):
+                if self.__cv_fold_ids[i] != test_fold_id:
+                    self.__query_indices[thread_id].add(i)
+
+        self.__lock.release()
+
+    def test_data(self):
+        query_indices = self.__query_indices[get_ident()]
+        indices = range(len(self.__data))
+        X = [self.__data[i] for i in indices if i not in query_indices]
+        y = [self.__labels[i] for i in indices if i not in query_indices]
+        return X, y
+
+    def train_data(self):
+        query_indices = self.__query_indices[get_ident()]
+        indices = range(len(self.__data))
+        X = [self.__data[i] for i in indices if i in query_indices]
+        y = [self.__labels[i] for i in indices if i in query_indices]
+        return X, y
+
+    def update_cache(self, keyword):
+        self.__lock.acquire()
+
+        if keyword not in self.__query_cache:
+            self.__query_cache[keyword] = set()
+
+            for i, tokens in enumerate(self.__tokenized):
+                if keyword in tokens:
+                    self.__query_cache[keyword].add(i)
+
+        self.__lock.release()

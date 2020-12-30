@@ -94,9 +94,20 @@ class CNNClassifier(BaseEstimator, ClassifierMixin):
         preds = [self.__label_field.vocab.itos[pred + 1] for pred in preds]
         return self.scoring(_Eval(preds), None, targets)
 
+    def __finalize_training(self, start, filename):
+        if self.verbose > 0:
+            self.__print_elapsed_time(time() - start)
+
+        if self.save_best and exists(filename):
+            remove(filename)
+
+        self.classes_ = self.__label_field.vocab.itos[1:]
+        return self
+
     def fit(self, X, y, sample_weight=None):
         if self.random_state is not None:
             torch.manual_seed(self.random_state)
+            torch.cuda.manual_seed(self.random_state)
 
         torch.backends.cudnn.deterministic = self.random_state is not None
         torch.backends.cudnn.benchmark = self.random_state is None
@@ -119,19 +130,18 @@ class CNNClassifier(BaseEstimator, ClassifierMixin):
                                 vectors=self.__text_field.vocab.vectors)
 
         if self.cuda and torch.cuda.is_available():
-            torch.cuda.set_device(self.device)
+            torch.cuda.device(self.device)
             self.__model.cuda()
 
         optimizer = torch.optim.Adam(self.__model.parameters(), lr=self.lr,
                                      weight_decay=self.max_norm)
         steps, best_acc, last_step = 0, 0, 0
-        active = True
         filename = "./{}.model".format(time())
-
-        self.__model.train()
 
         for epoch in range(self.epochs):
             for batch in train_iter:
+                self.__model.train()
+
                 feature, target = batch.text.t_(), batch.label.sub_(1)
 
                 if self.cuda and torch.cuda.is_available():
@@ -153,38 +163,31 @@ class CNNClassifier(BaseEstimator, ClassifierMixin):
                         if self.save_best:
                             torch.save(self.__model.state_dict(), filename)
                     elif steps - last_step >= self.early_stop:
-                        active = False
-                        break
-
-            if not active:
-                break
+                        return self.__finalize_training(start, filename)
 
         if self.save_best and exists(filename):
-            self.__model.load_state_dict(torch.load(filename))
-            remove(filename)
+            if self.__eval(dev_iter) < best_acc:
+                self.__model.load_state_dict(torch.load(filename))
 
-        self.classes_ = self.__label_field.vocab.itos[1:]
-
-        if self.verbose > 0:
-            self.__print_elapsed_time(time() - start)
-
-        return self
+        return self.__finalize_training(start, filename)
 
     def __predict(self, X):
-        texts = []
-
         self.__model.eval()
 
-        for text in X:
-            assert isinstance(text, str)
+        cuda = self.cuda and torch.cuda.is_available()
+        preds, batch_start = [], 0
 
-            text = self.__text_field.preprocess(text)
-            text = [self.__text_field.vocab.stoi[x] for x in text]
-            texts.append(torch.tensor(text))
+        while batch_start < len(X):
+            batch_end = min(batch_start + self.batch_size, len(X))
+            X_b = X[batch_start:batch_end]
+            X_b = [self.__text_field.preprocess(t) for t in X_b]
+            X_b = self.__text_field.pad(X_b)
+            X_b = [[self.__text_field.vocab.stoi[x] for x in t] for t in X_b]
+            X_b = torch.tensor(X_b).cuda() if cuda else torch.tensor(X_b)
+            preds.append(self.__model(X_b).clone().detach().cpu())
+            batch_start = batch_end
 
-        x = torch.stack(texts, 0)
-        x = x.cuda() if self.cuda and torch.cuda.is_available() else x
-        return self.__model(x)
+        return torch.cat(preds)
 
     def predict(self, X):
         y_pred = torch.argmax(self.__predict(X), 1)
