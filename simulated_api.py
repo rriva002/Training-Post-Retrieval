@@ -14,6 +14,9 @@ class SimulatedAPI(object):
         self.__tokenized = [set(word_tokenize(document)) for document in data]
         self.__topics = labels
 
+    def __len__(self):
+        return len(self.__data)
+
     def assign_binary_labels(self, topic, pos="Positive", neg="Negative"):
         if self.__topics is not None:
             t1 = topic.lower()

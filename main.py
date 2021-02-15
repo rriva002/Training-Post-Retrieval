@@ -12,7 +12,7 @@ from simulated_api import SimulatedAPI
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.feature_selection import mutual_info_classif
-from sklearn.metrics import accuracy_score, balanced_accuracy_score
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 from sklearn.metrics import make_scorer, precision_score, recall_score
 from sklearn.pipeline import Pipeline
 from sklearn.svm import SVC
@@ -22,15 +22,16 @@ from time import time
 
 default_data_lengths = [100 * (i + 1) for i in range(10)]
 default_ksas = ["all_keywords", "50_50", "tp_ksa", "tpp_ksa", "tprn_ksa",
-                "tpprn_ksa", "liu", "random", "ideal"]
-default_stats = ["accuracy", "precision", "recall", "percent_positive",
-                 "kl_pos", "kl_neg", "balance_and_diversity", "time"]
+                "tpprn_ksa", "liu", "active_learning", "random", "ideal"]
+default_stats = ["accuracy", "balanced_accuracy", "precision", "recall", "f1",
+                 "percent_positive", "kl_pos", "kl_neg",
+                 "balance_and_diversity", "time"]
 
 
 class CVThread(Thread):
     def __init__(self, assist, classifier, data_lengths, generate_keywords,
                  keywords, ksas, lock, n_keywords, neg, pos, queue,
-                 random_state, results, stats, topic, *args, **kwargs):
+                 random_state, results, source, stats, topic, *args, **kwargs):
         self.assist = assist
         self.classifier = classifier
         self.data_lengths = data_lengths
@@ -44,6 +45,7 @@ class CVThread(Thread):
         self.pos = pos
         self.random_state = random_state
         self.results = results
+        self.source = source
         self.stats = stats
         self.topic = topic
 
@@ -64,7 +66,7 @@ class CVThread(Thread):
                 random_samples = None
 
             if self.generate_kw or self.kw is None or len(self.kw) == 0:
-                directory = "keywords/{}".format(source)
+                directory = "keywords/{}".format(self.source)
                 t = self.topic.lower().replace(" ", "_")
                 fn = "{}/{}_keywords_{}_{}.txt".format(directory, t, fold,
                                                        num_cv_folds)
@@ -87,18 +89,19 @@ class CVThread(Thread):
             for ksa in self.ksas:
                 for m in self.data_lengths:
                     print("    Fold {}: {}, m={}".format(fold, ksa, m))
-                    test(self.topic, keywords, self.assist, self.classifier,
-                         m, self.pos, self.neg, self.results, random_samples,
-                         ksa=ksa, random_state=self.random_state,
-                         lock=self.lock)
+                    test(self.source, self.topic, keywords, self.assist,
+                         self.classifier, m, self.pos, self.neg, self.results,
+                         random_samples, self.lock, ksa=ksa,
+                         random_state=self.random_state)
 
             self.queue.task_done()
 
 
 def batch_experiments(source, classifier="cnn", generate_keywords=True,
-                      n_keywords=5, num_cv_folds=5, num_threads="cv",
+                      n_keywords=5, cv=True, num_cv_folds=5, num_threads="cv",
                       random_state=None, ksas=default_ksas,
                       stats=default_stats, data_lengths=default_data_lengths):
+    num_threads = num_cv_folds if cv and num_threads == "cv" else 1
     pos, neg = "Positive", "Negative"
     topics, keywords = [], []
 
@@ -115,6 +118,7 @@ def batch_experiments(source, classifier="cnn", generate_keywords=True,
     percentage_stats = {"accuracy", "balanced_accuracy", "percent_positive"}
     results = dict(zip(topics, [{} for topic in topics]))
     queue, lock = Queue(), Lock()
+    denominator = num_cv_folds if cv else 1
 
     for topic in topics:
         for ksa in ksas:
@@ -128,20 +132,23 @@ def batch_experiments(source, classifier="cnn", generate_keywords=True,
         print("  Topic: " + topic)
         assist.get_api().assign_binary_labels(topic, pos=pos, neg=neg)
 
-        for fold in range(num_cv_folds):
-            queue.put((fold, num_cv_folds))
+        if cv:
+            for fold in range(num_cv_folds):
+                queue.put((fold, num_cv_folds))
+        else:
+            queue.put((0, num_cv_folds))
 
-        for _ in range(num_cv_folds if num_threads == "cv" else num_threads):
+        for _ in range(num_threads):
             CVThread(assist, classifier, data_lengths, generate_keywords,
                      keywords[i], ksas, lock, n_keywords, neg, pos, queue,
-                     random_state, results, stats, topic).start()
+                     random_state, results, source, stats, topic).start()
 
         queue.join()
 
         for ksa in ksas:
             for stat in stats:
                 for m in data_lengths:
-                    result = sum(results[topic][ksa][stat][m]) / num_cv_folds
+                    result = sum(results[topic][ksa][stat][m]) / denominator
 
                     if stat in percentage_stats:
                         result = "%0.2f" % (100 * result) + "%"
@@ -218,24 +225,23 @@ def select_classifier(classifier, random_state=None, active_learning=False):
         scoring = make_scorer(balanced_accuracy_score)
         return CNNClassifier(scoring=scoring, vectors="fasttext.en.300d",
                              random_state=random_state, static=True, epochs=50,
-                             batch_size=100)
+                             batch_size=100, early_stop=200)
 
     vectorizer = TfidfVectorizer(max_features=1000, min_df=0.03,
                                  ngram_range=(1, 3), stop_words="english")
 
     if classifier == "rf":
         classifier = RandomForestClassifier(n_estimators=2000, n_jobs=-1,
-                                            random_state=random_state,
-                                            class_weight="balanced")
+                                            random_state=random_state)
     elif classifier == "svm":
         classifier = SVC(kernel="linear", probability=active_learning,
-                         class_weight="balanced", random_state=random_state)
+                         random_state=random_state)
 
     return Pipeline([("vectorizer", vectorizer), ("classifier", classifier)])
 
 
-def test(topic, keywords, assist, classifier, m, positive, negative, results,
-         random_samples, ksa="50_50", random_state=None, lock=None):
+def test(source, topic, keywords, assist, classifier, m, positive, negative,
+         results, random_samples, lock, ksa="50_50", random_state=None):
     assist.get_api().set_random_state(random_state)
 
     stats = results[topic][ksa].keys()
@@ -255,7 +261,7 @@ def test(topic, keywords, assist, classifier, m, positive, negative, results,
     elif ksa == "all_keywords":
         X, y = assist.all_keywords(keywords, m)
     elif ksa == "active_learning":
-        if lock is not None and lock_early:
+        if lock_early:
             lock.acquire()
 
         classifier = select_classifier(classifier, random_state=random_state,
@@ -272,7 +278,7 @@ def test(topic, keywords, assist, classifier, m, positive, negative, results,
     elapsed = round(time() - start)
     X_test, y_test = assist.get_api().test_data()
 
-    if lock is not None and ksa != "active_learning" and lock_early:
+    if ksa != "active_learning" and lock_early:
         lock.acquire()
 
     if len(set(y)) == 1:
@@ -285,7 +291,7 @@ def test(topic, keywords, assist, classifier, m, positive, negative, results,
 
         predictions = classifier.predict(X_test)
 
-    if lock is not None and not lock_early:
+    if not lock_early:
         lock.acquire()
 
     for stat in stats:
@@ -293,6 +299,9 @@ def test(topic, keywords, assist, classifier, m, positive, negative, results,
             value = accuracy_score(y_test, predictions)
         elif stat == "balanced_accuracy":
             value = balanced_accuracy_score(y_test, predictions)
+        elif stat == "f1":
+            value = f1_score(y_test, predictions, pos_label=positive,
+                             zero_division=0)
         elif stat == "precision":
             value = precision_score(y_test, predictions, pos_label=positive,
                                     zero_division=0)
@@ -323,10 +332,9 @@ def test(topic, keywords, assist, classifier, m, positive, negative, results,
         else:
             results[topic][ksa]["balance_and_diversity"][m].append(0)
 
-    if lock is not None:
-        lock.release()
+    lock.release()
 
 
 if __name__ == "__main__":
     for source in ["ds", "huffpost", "reddit"]:
-        batch_experiments(source, random_state=10)
+        batch_experiments(source, cv=False, random_state=10)
