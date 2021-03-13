@@ -1,8 +1,6 @@
 import csv
 import re
 from json import loads
-from os import makedirs, path
-from pathlib import Path
 from random import sample, seed
 
 
@@ -66,34 +64,6 @@ def load_data(source, num_cv_folds=5, pos="Positive", neg="Negative",
 def load_ds_data(num_cv_folds=5, pos="Positive", neg="Negative",
                  random_state=None):
     filename = data_dir + "ds_data.csv"
-
-    if not path.exists(data_dir):
-        makedirs(data_dir)
-
-    if not Path(filename).is_file():
-        source = "http://www.dailystrength.org"
-        sql = "SELECT url, body, disorder FROM {} WHERE source = '{}' "
-        sql += "AND url LIKE '{}/group/%' AND replyid = 0 AND body IS NOT NULL"
-        urls = set()
-        connection = mysql_connection()
-        cursor = connection.cursor()
-
-        with open(filename, "w") as file:
-            writer = csv.writer(file, lineterminator="\n")
-
-            cursor.execute(sql.format("healthforumposts", source, source))
-
-            for (url, body, disorder) in cursor:
-                text = str(body)
-
-                if url in urls or len(text.strip()) == 0:
-                    continue
-
-                urls.add(url)
-                writer.writerow([text.replace("\n", " "), disorder])
-
-        del urls
-
     return construct_cv_dataset(filename, num_cv_folds, random_state)
 
 
@@ -122,41 +92,4 @@ def load_huffpost_data(num_cv_folds=5, pos="Positive", neg="Negative",
 def load_reddit_data(num_cv_folds=5, pos="Positive", neg="Negative",
                      random_state=None):
     filename = data_dir + "reddit_data.csv"
-
-    if not path.exists(data_dir):
-        makedirs(data_dir)
-
-    if not Path(filename).is_file():
-        ecig, source = "Electronic Cigarette", "https://www.reddit.com"
-        sql = "SELECT url, body, disorder FROM {} WHERE source = '{}' "
-        sql += "AND replyid = 0 AND body != '[removed]' AND body IS NOT NULL"
-        urls = set()
-        connection = mysql_connection()
-        cursor = connection.cursor()
-
-        with open(filename, "w") as file:
-            writer = csv.writer(file, lineterminator="\n")
-
-            for table in ["healthforumposts", "ecigarette"]:
-                cursor.execute(sql.format(table, source))
-
-                for (url, body, disorder) in cursor:
-                    text = str(body)
-
-                    if url in urls or len(text.strip()) == 0:
-                        continue
-
-                    sub = ecig if table == "ecigarette" else disorder
-
-                    urls.add(url)
-                    writer.writerow([text.replace("\n", " "), sub])
-
-        del urls
-
     return construct_cv_dataset(filename, num_cv_folds, random_state)
-
-
-def mysql_connection():
-    from mysql import connector
-    return connector.connect(host="dblab-rack20", database="HEALTHDATA",
-                             user="rriva002", password="passwd", use_pure=True)
